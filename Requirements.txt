@@ -1,0 +1,10 @@
+streamlit
+python-dotenv
+pymongo
+pinecone
+langchain-pinecone
+langchain
+langchain-community
+langchain-mistralai
+langchain-text-splitters
+pypdf
