@@ -309,3 +309,5 @@ Question:
 
 else:
     st.info("Upload a PDF and click 'Create Vector Database' to get started.")
+
+    # uv run streamlit run osd_rag.py
