@@ -1,38 +1,3 @@
-"""
-RAG Book Assistant — Streamlit + Mistral + Pinecone + MongoDB Atlas
----------------------------------------------------------------------
-What's new in this version:
-
-1. VECTOR DATABASE: Chroma -> Pinecone
-   Pinecone is a managed, cloud-hosted vector database. Unlike Chroma's
-   local `persist_directory`, Pinecone's index lives in the cloud, so
-   it survives app restarts/redeploys and works on stateless hosting
-   (Streamlit Cloud, Render, etc.) without needing a persistent disk.
-
-2. CHATGPT-STYLE CHAT HISTORY
-   Instead of one flat, ever-growing conversation, chats are now split
-   into SESSIONS (like ChatGPT's left sidebar):
-     - "+ New Chat" starts a fresh conversation
-     - Every past session is listed in the sidebar, titled after its
-       first question, newest on top
-     - Clicking a past session reloads that conversation's messages
-   Storage in MongoDB now has two collections:
-     - chat_sessions: {_id, user_id, title, created_at}
-     - chat_messages: {_id, session_id, role, content, created_at}
-
-Setup:
-  pip install streamlit pymongo langchain langchain-community \
-      langchain-mistralai langchain-pinecone pinecone \
-      langchain-text-splitters python-dotenv pypdf
-
-  .env additions:
-    MISTRAL_API_KEY=...
-    MONGODB_URI=mongodb+srv://<user>:<pass>@<cluster>.mongodb.net/?retryWrites=true&w=majority
-    MONGODB_DB=rag_book_assistant
-    PINECONE_API_KEY=...
-    PINECONE_INDEX=rag-book-assistant
-"""
-
 import os
 import tempfile
 import uuid
