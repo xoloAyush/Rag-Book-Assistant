@@ -2,8 +2,7 @@ streamlit
 python-dotenv
 pymongo
 pinecone
-langchain-pinecone
-langchain
+langchain-pinecone==0.2.13
 langchain-community
 langchain-mistralai
 langchain-text-splitters
