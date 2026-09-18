@@ -17,6 +17,8 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_mistralai import ChatMistralAI, MistralAIEmbeddings
 from langchain_core.prompts import ChatPromptTemplate
 
+from user_auth import require_auth, render_user_sidebar
+
 load_dotenv()
 
 st.set_page_config(page_title="RAG Book Assistant", page_icon="📚", layout="wide")
@@ -92,6 +94,18 @@ def save_message(db, session_id: str, role: str, content: str):
         st.warning(f"Could not save message: {e}")
 
 
+def delete_session(db, session_id: str) -> bool:
+    """Delete a chat session and all of its associated messages."""
+    try:
+        db["chat_sessions"].delete_one({"_id": session_id})
+        db["chat_messages"].delete_many({"session_id": session_id})
+        return True
+    except PyMongoError as e:
+        st.warning(f"Could not delete chat session: {e}")
+        return False
+
+
+
 # ======================================================
 # Pinecone — vector database for PDF chunks
 # ======================================================
@@ -128,21 +142,16 @@ def pinecone_has_vectors(index_name: str) -> bool:
 
 
 # ======================================================
-# Sidebar: user id + ChatGPT-style session list
+# User Authentication & Session Setup
 # ======================================================
 
-with st.sidebar:
-    st.subheader("👤 User")
-    user_id = st.text_input("Username", value=st.session_state.get("user_id", ""))
-    if user_id:
-        st.session_state.user_id = user_id
-
-if "user_id" not in st.session_state or not st.session_state.user_id:
-    st.title("📚 RAG Book Assistant")
-    st.info("👈 Enter a username in the sidebar to start chatting.")
-    st.stop()
-
 mongo_db = get_mongo_db()
+current_user = require_auth(mongo_db)
+if current_user:
+    render_user_sidebar(mongo_db, current_user)
+
+
+
 
 if "session_id" not in st.session_state:
     st.session_state.session_id = None  # None = unsaved new chat
@@ -160,17 +169,34 @@ with st.sidebar:
     st.caption("Your chats")
 
     sessions = list_sessions(mongo_db, st.session_state.user_id)
+    if not sessions:
+        st.caption("No past chats yet.")
     for s in sessions:
         label = s["title"] or "New Chat"
         is_active = s["_id"] == st.session_state.session_id
-        if st.button(
-            ("💬 " if not is_active else "▶️ ") + label,
-            key=f"session_{s['_id']}",
-            use_container_width=True,
-        ):
-            st.session_state.session_id = s["_id"]
-            st.session_state.messages = load_messages(mongo_db, s["_id"])
-            st.rerun()
+        col_chat, col_del = st.columns([0.82, 0.18])
+        with col_chat:
+            if st.button(
+                ("💬 " if not is_active else "▶️ ") + label,
+                key=f"session_{s['_id']}",
+                use_container_width=True,
+            ):
+                st.session_state.session_id = s["_id"]
+                st.session_state.messages = load_messages(mongo_db, s["_id"])
+                st.rerun()
+        with col_del:
+            if st.button(
+                "🗑️",
+                key=f"del_{s['_id']}",
+                help=f"Delete '{label}'",
+                use_container_width=True,
+            ):
+                delete_session(mongo_db, s["_id"])
+                if st.session_state.session_id == s["_id"]:
+                    st.session_state.session_id = None
+                    st.session_state.messages = []
+                st.rerun()
+
 
 # ======================================================
 # PDF upload + Pinecone vector DB creation
@@ -199,7 +225,10 @@ if uploaded_file:
             )
             chunks = splitter.split_documents(docs)
 
-            embeddings = MistralAIEmbeddings(model="mistral-embed")
+            embeddings = MistralAIEmbeddings(
+    model="mistral-embed",
+    api_key=os.getenv("MISTRAL_API_KEY")
+)
             index_name = get_pinecone_index_name()
 
             PineconeVectorStore.from_documents(
@@ -234,7 +263,11 @@ if pinecone_has_vectors(index_name):
         },
     )
 
-    llm = ChatMistralAI(model="mistral-small-2506")
+    llm = ChatMistralAI(
+    model="codestral-latest",
+    temperature=0,
+    api_key=os.getenv("MISTRAL_API_KEY")
+)
 
     prompt = ChatPromptTemplate.from_messages(
         [

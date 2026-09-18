@@ -7,3 +7,8 @@ langchain-community
 langchain-mistralai
 langchain-text-splitters
 pypdf
+bcrypt>=5.0.0
+pyjwt>=2.10.0
+resend>=2.40.0
+streamlit-cookies-controller>=0.0.4
+
