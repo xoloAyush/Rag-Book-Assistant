@@ -13,6 +13,13 @@ from streamlit_cookies_controller import CookieController
 from dotenv import load_dotenv
 from pymongo.errors import PyMongoError
 
+from rate_limiter import (
+    check_rate_limit,
+    record_rate_limit_event,
+    clear_rate_limit,
+    get_rate_limit_status,
+)
+
 load_dotenv()
 
 # ======================================================
@@ -29,6 +36,17 @@ APP_URL = os.getenv("APP_URL", "http://localhost:8501").strip()
 
 AUTH_COOKIE_NAME = "rag_auth_jwt"
 COOKIE_MAX_AGE = 7 * 24 * 3600  # 7 days in seconds
+
+# Rate Limit Thresholds (User Authentication Layer)
+RATE_LIMIT_LOGIN_MAX = 5
+RATE_LIMIT_LOGIN_WINDOW = 900          # 5 attempts per 15 minutes
+
+RATE_LIMIT_REGISTER_MAX = 5
+RATE_LIMIT_REGISTER_WINDOW = 3600      # 5 registrations per hour
+
+RATE_LIMIT_FORGOT_MAX = 3
+RATE_LIMIT_FORGOT_WINDOW = 3600        # 3 reset requests per hour
+
 
 
 # ======================================================
@@ -211,13 +229,20 @@ def validate_password(password: str) -> tuple[bool, str]:
 
 
 def register_user(db, username: str, email: str, password: str) -> tuple[bool, str]:
-    """Register a new user in MongoDB."""
+    """Register a new user in MongoDB (Rate limit: 5 per hour)."""
     init_user_db(db)
 
     clean_email = email.strip().lower()
     is_valid_e, err_e = validate_email(clean_email)
     if not is_valid_e:
         return False, err_e
+
+    # Enforce registration rate limit (5 per hour)
+    allowed, _, _, wait_str = check_rate_limit(
+        db, "register", clean_email, RATE_LIMIT_REGISTER_MAX, RATE_LIMIT_REGISTER_WINDOW
+    )
+    if not allowed:
+        return False, f"Registration limit reached (maximum {RATE_LIMIT_REGISTER_MAX} registrations per hour). Please wait {wait_str} before trying again."
 
     # If username is left empty, auto-default to email prefix
     clean_username = username.strip()
@@ -242,7 +267,6 @@ def register_user(db, username: str, email: str, password: str) -> tuple[bool, s
     if db["users"].find_one({"email": clean_email}):
         return False, f"An account with email '{clean_email}' already exists."
 
-
     hashed = hash_password(password)
     user_doc = {
         "_id": str(uuid.uuid4()),
@@ -255,6 +279,7 @@ def register_user(db, username: str, email: str, password: str) -> tuple[bool, s
 
     try:
         db["users"].insert_one(user_doc)
+        record_rate_limit_event(db, "register", clean_email)
         return True, "Registration successful! You can now log in."
     except PyMongoError as e:
         return False, f"Database error during registration: {str(e)}"
@@ -262,7 +287,7 @@ def register_user(db, username: str, email: str, password: str) -> tuple[bool, s
 
 def authenticate_user(db, identifier: str, password: str) -> tuple[bool, str, dict | None, str | None]:
     """
-    Authenticate user by username or email.
+    Authenticate user by username or email (Rate limit: 5 attempts per 15 minutes).
     Returns: (success, message, user_dict, access_token)
     """
     init_user_db(db)
@@ -270,6 +295,13 @@ def authenticate_user(db, identifier: str, password: str) -> tuple[bool, str, di
 
     if not identifier or not password:
         return False, "Please provide both username/email and password.", None, None
+
+    # Enforce login rate limit (5 attempts per 15 minutes)
+    allowed, _, _, wait_str = check_rate_limit(
+        db, "login", identifier, RATE_LIMIT_LOGIN_MAX, RATE_LIMIT_LOGIN_WINDOW
+    )
+    if not allowed:
+        return False, f"Too many login attempts. Rate limit is {RATE_LIMIT_LOGIN_MAX} per 15 minutes. Please wait {wait_str} before trying again.", None, None
 
     # Try email or username
     user = db["users"].find_one({
@@ -280,10 +312,15 @@ def authenticate_user(db, identifier: str, password: str) -> tuple[bool, str, di
     })
 
     if not user:
+        record_rate_limit_event(db, "login", identifier)
         return False, "Invalid username/email or password.", None, None
 
     if not verify_password(password, user.get("password_hash", "")):
+        record_rate_limit_event(db, "login", identifier)
         return False, "Invalid username/email or password.", None, None
+
+    # Login succeeded: clear failed attempt counters for this identifier
+    clear_rate_limit(db, "login", identifier)
 
     token = create_access_token({
         "sub": user["_id"],
@@ -301,7 +338,7 @@ def authenticate_user(db, identifier: str, password: str) -> tuple[bool, str, di
 
 def request_password_reset(db, email: str, base_url: str = APP_URL) -> tuple[bool, str, str | None, bool]:
     """
-    Process a forgot password request.
+    Process a forgot password request (Rate limit: 3 requests per hour).
     Generates a signed JWT reset token and dispatches an email.
     Returns: (success, message, reset_token, email_sent)
     """
@@ -312,10 +349,18 @@ def request_password_reset(db, email: str, base_url: str = APP_URL) -> tuple[boo
     if not is_valid_e:
         return False, err_e, None, False
 
+    # Enforce forgot password rate limit (3 requests per hour)
+    allowed, _, _, wait_str = check_rate_limit(
+        db, "forgot_password", clean_email, RATE_LIMIT_FORGOT_MAX, RATE_LIMIT_FORGOT_WINDOW
+    )
+    if not allowed:
+        return False, f"Password reset request limit reached (maximum {RATE_LIMIT_FORGOT_MAX} requests per hour). Please wait {wait_str} before requesting another reset.", None, False
+
     user = db["users"].find_one({"email": clean_email})
     if not user:
         return False, f"No user account found with email '{clean_email}'.", None, False
 
+    record_rate_limit_event(db, "forgot_password", clean_email)
     reset_token = create_reset_token(clean_email, expires_minutes=JWT_RESET_EXPIRE_MINUTES)
     email_sent, email_msg = send_reset_email(clean_email, reset_token, base_url=base_url)
 
@@ -323,6 +368,7 @@ def request_password_reset(db, email: str, base_url: str = APP_URL) -> tuple[boo
         return True, f"Password reset instructions have been sent to {clean_email}.", reset_token, True
     else:
         return True, f"Reset token generated successfully. ({email_msg})", reset_token, False
+
 
 
 def reset_password_with_token(db, reset_token: str, new_password: str) -> tuple[bool, str]:

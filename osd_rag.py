@@ -18,12 +18,25 @@ from langchain_mistralai import ChatMistralAI, MistralAIEmbeddings
 from langchain_core.prompts import ChatPromptTemplate
 
 from user_auth import require_auth, render_user_sidebar
+from rate_limiter import (
+    check_rate_limit,
+    record_rate_limit_event,
+    get_rate_limit_status,
+)
 
 load_dotenv()
 
 st.set_page_config(page_title="RAG Book Assistant", page_icon="📚", layout="wide")
 
 MISTRAL_EMBED_DIMENSION = 1024  # mistral-embed output size
+
+# Rate Limit Thresholds (Protected Routes)
+RATE_LIMIT_UPLOAD_MAX = 3
+RATE_LIMIT_UPLOAD_WINDOW = 3600    # 3 PDF uploads per hour
+
+RATE_LIMIT_QUESTION_MAX = 10
+RATE_LIMIT_QUESTION_WINDOW = 3600  # 10 questions per hour
+
 
 # ======================================================
 # MongoDB Atlas — sessions + messages
@@ -165,8 +178,22 @@ with st.sidebar:
         st.session_state.messages = []
         st.rerun()
 
+    # Live Hourly Quota Display
+    q_status = get_rate_limit_status(
+        mongo_db, "ask_question", st.session_state.user_id, RATE_LIMIT_QUESTION_MAX, RATE_LIMIT_QUESTION_WINDOW
+    )
+    u_status = get_rate_limit_status(
+        mongo_db, "pdf_upload", st.session_state.user_id, RATE_LIMIT_UPLOAD_MAX, RATE_LIMIT_UPLOAD_WINDOW
+    )
+    st.caption(
+        f"⚡ **Hourly Quotas**\n\n"
+        f"• Questions: **{q_status['used']}/{q_status['max']}**\n\n"
+        f"• PDF Uploads: **{u_status['used']}/{u_status['max']}**"
+    )
+
     st.divider()
     st.caption("Your chats")
+
 
     sessions = list_sessions(mongo_db, st.session_state.user_id)
     if not sessions:
@@ -214,30 +241,45 @@ if uploaded_file:
 
     st.success("PDF uploaded successfully!")
 
+    upload_stat = get_rate_limit_status(
+        mongo_db, "pdf_upload", st.session_state.user_id, RATE_LIMIT_UPLOAD_MAX, RATE_LIMIT_UPLOAD_WINDOW
+    )
+    st.caption(f"📊 Upload quota: {upload_stat['remaining']}/{upload_stat['max']} remaining this hour")
+
     if st.button("Create Vector Database"):
-        with st.spinner("Processing document..."):
-            loader = PyPDFLoader(file_path)
-            docs = loader.load()
+        allowed, rem, wait, wait_str = check_rate_limit(
+            mongo_db, "pdf_upload", st.session_state.user_id, RATE_LIMIT_UPLOAD_MAX, RATE_LIMIT_UPLOAD_WINDOW
+        )
+        if not allowed:
+            st.error(f"⚠️ PDF upload rate limit reached (maximum {RATE_LIMIT_UPLOAD_MAX} per hour). Please wait {wait_str} before uploading again.")
+        else:
+            with st.spinner("Processing document..."):
+                loader = PyPDFLoader(file_path)
+                docs = loader.load()
 
-            splitter = RecursiveCharacterTextSplitter(
-                chunk_size=1000,
-                chunk_overlap=200,
-            )
-            chunks = splitter.split_documents(docs)
+                splitter = RecursiveCharacterTextSplitter(
+                    chunk_size=1000,
+                    chunk_overlap=200,
+                )
+                chunks = splitter.split_documents(docs)
 
-            embeddings = MistralAIEmbeddings(
-    model="mistral-embed",
-    api_key=os.getenv("MISTRAL_API_KEY")
-)
-            index_name = get_pinecone_index_name()
+                embeddings = MistralAIEmbeddings(
+                    model="mistral-embed",
+                    api_key=os.getenv("MISTRAL_API_KEY")
+                )
+                index_name = get_pinecone_index_name()
 
-            PineconeVectorStore.from_documents(
-                documents=chunks,
-                embedding=embeddings,
-                index_name=index_name,
-            )
+                PineconeVectorStore.from_documents(
+                    documents=chunks,
+                    embedding=embeddings,
+                    index_name=index_name,
+                )
 
-        st.success("Vector database created in Pinecone!")
+                record_rate_limit_event(mongo_db, "pdf_upload", st.session_state.user_id)
+
+            st.success("Vector database created in Pinecone!")
+            st.rerun()
+
 
 # ======================================================
 # Load Pinecone index + set up retriever / LLM
@@ -306,39 +348,48 @@ Question:
     query = st.chat_input("Enter your question")
 
     if query:
-        # Lazily create the session in MongoDB on first message,
-        # titled after the first question (ChatGPT-style auto-title).
-        if st.session_state.session_id is None:
-            st.session_state.session_id = create_session(
-                mongo_db, st.session_state.user_id, title=query
-            )
+        allowed, rem, wait, wait_str = check_rate_limit(
+            mongo_db, "ask_question", st.session_state.user_id, RATE_LIMIT_QUESTION_MAX, RATE_LIMIT_QUESTION_WINDOW
+        )
+        if not allowed:
+            st.error(f"⚠️ Rate limit reached: Maximum {RATE_LIMIT_QUESTION_MAX} questions per hour. Please wait {wait_str} before asking another question.")
+        else:
+            record_rate_limit_event(mongo_db, "ask_question", st.session_state.user_id)
 
-        st.session_state.messages.append({"role": "user", "content": query})
-        with st.chat_message("user"):
-            st.write(query)
-
-        with st.chat_message("assistant"):
-            with st.spinner("Thinking..."):
-                docs = retriever.invoke(query)
-                context = "\n\n".join(doc.page_content for doc in docs)
-
-                final_prompt = prompt.invoke(
-                    {
-                        "context": context,
-                        "question": query,
-                    }
+            # Lazily create the session in MongoDB on first message,
+            # titled after the first question (ChatGPT-style auto-title).
+            if st.session_state.session_id is None:
+                st.session_state.session_id = create_session(
+                    mongo_db, st.session_state.user_id, title=query
                 )
 
-                response = llm.invoke(final_prompt)
-                answer = response.content
-                st.write(answer)
+            st.session_state.messages.append({"role": "user", "content": query})
+            with st.chat_message("user"):
+                st.write(query)
 
-        st.session_state.messages.append({"role": "assistant", "content": answer})
+            with st.chat_message("assistant"):
+                with st.spinner("Thinking..."):
+                    docs = retriever.invoke(query)
+                    context = "\n\n".join(doc.page_content for doc in docs)
 
-        save_message(mongo_db, st.session_state.session_id, "user", query)
-        save_message(mongo_db, st.session_state.session_id, "assistant", answer)
+                    final_prompt = prompt.invoke(
+                        {
+                            "context": context,
+                            "question": query,
+                        }
+                    )
 
-        st.rerun()  # refresh sidebar so a brand-new session shows up in the list
+                    response = llm.invoke(final_prompt)
+                    answer = response.content
+                    st.write(answer)
+
+            st.session_state.messages.append({"role": "assistant", "content": answer})
+
+            save_message(mongo_db, st.session_state.session_id, "user", query)
+            save_message(mongo_db, st.session_state.session_id, "assistant", answer)
+
+            st.rerun()  # refresh sidebar so quota indicators and new session show up
+
 
 else:
     st.info("Upload a PDF and click 'Create Vector Database' to get started.")
